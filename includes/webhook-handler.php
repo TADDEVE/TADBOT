@@ -18,6 +18,7 @@ function handle_telegram_webhook(WP_REST_Request $request) {
     $user_id = $data['message']['from']['id'];
     $username = isset($data['message']['from']['username']) ? $data['message']['from']['username'] : "No username";
     $text = isset($data['message']['text']) ? $data['message']['text'] : "";
+    
 
     error_log("Chat ID: {$chat_id}, User ID: {$user_id}, Username: {$username}, Text: {$text}");
 
@@ -25,28 +26,38 @@ function handle_telegram_webhook(WP_REST_Request $request) {
         sendMessage($chat_id, "Por favor, proporciona la dirección de correo con la que realizaste la compra de la suscripción.");
     } else {
         if (filter_var($text, FILTER_VALIDATE_EMAIL)) {
-            if (is_email_registered_and_has_active_subscription($text)) {
-                addMemberToTelegramGroup($chat_id);
-            } else {
-                sendMessage($chat_id, "Lo siento, tu dirección de correo electrónico no está registrada en nuestra plataforma o no tienes una suscripción activa. Por favor, regístrate o verifica tu suscripción.");
-            }
+    if (is_email_registered_and_has_active_subscription($text)) {
+        // Guarda la información del usuario antes de enviarle el enlace de invitación
+        $is_stored = store_user_info($username, $user_id, $chat_id, $text);
+        if ($is_stored) {
+            addMemberToTelegramGroup($chat_id);
+        }
+    } else {
+        sendMessage($chat_id, "Lo siento, tu dirección de correo electrónico no está registrada en nuestra plataforma o no tienes una suscripción activa. Por favor, regístrate o verifica tu suscripción.");
+    }
+} else {
+    sendMessage($chat_id, "Por favor, proporciona la dirección de correo con la que realizaste la compra de la suscripción.");
+}
+
+
+  if (isset($data['message']['new_chat_members'])) {
+    foreach ($data['message']['new_chat_members'] as $new_member) {
+        $new_member_id = $new_member['id'];
+        $new_member_username = isset($new_member['username']) ? $new_member['username'] : "No username";
+        
+        error_log("Verificando el nuevo miembro con ID: {$new_member_id}");
+        
+        if (!is_member_valid($new_member_id)) {
+            error_log("El miembro {$new_member_id} no es válido. Expulsando del grupo...");
+            kickMember($new_member_id, $chat_id);
         } else {
-            sendMessage($chat_id, "Por favor, proporciona la dirección de correo con la que realizaste la compra de la suscripción.");
+            error_log("El miembro {$new_member_id} es válido.");
+            store_user_info($new_member_username, $new_member_id, $chat_id, $text);
         }
     }
 
-    if (isset($data['message']['new_chat_members'])) {
-        foreach ($data['message']['new_chat_members'] as $new_member) {
-            error_log("Verificando el nuevo miembro con ID: {$new_member['id']}");
-            
-            if (!is_member_valid($new_member['id'])) {
-                error_log("El miembro {$new_member['id']} no es válido. Expulsando del grupo...");
-                kickMember($new_member['id'], $chat_id);
-            } else {
-                error_log("El miembro {$new_member['id']} es válido.");
-            }
-        }
-    }
+}
+}
 
     return new WP_REST_Response('Processed.');
 }
@@ -55,29 +66,43 @@ function store_user_info($username, $user_id, $chat_id, $email) {
     global $wpdb;
     $table_name = $wpdb->prefix . 'telegram_users';
 
+    // Verificar si el correo electrónico ya ha sido utilizado por otro usuario
+    $existing_email = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE email = %s AND user_id != %d", $email, $user_id));
+
+    if ($existing_email) {
+        error_log("Error: El correo electrónico {$email} ya ha sido utilizado por otro usuario de Telegram.");
+        sendMessage($chat_id, "Este correo electrónico ya ha sido utilizado por otro usuario. Si crees que esto es un error, por favor contacta con el soporte.");
+         kickMember($user_id);
+        return false; // Retorna false para indicar que el correo electrónico ya ha sido utilizado
+    }
+
     // Verificar si el usuario ya está registrado
     $existing_user = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE user_id = %d", $user_id));
 
     if ($existing_user) {
         // Actualizar datos
-        $wpdb->update($table_name, ['email' => $email], ['user_id' => $user_id]);
+        $wpdb->update($table_name, ['email' => $email, 'is_in_group' => 1], ['user_id' => $user_id]);
     } else {
         // Insertar datos
         $wpdb->insert($table_name, [
             'username' => $username,
             'user_id' => $user_id,
             'chat_id' => $chat_id,
-            'email' => $email
+            'email' => $email,
+            'is_in_group' => 1
         ]);
     }
 
     // Registro de errores de la base de datos
     if ($wpdb->last_error) {
         error_log("Error al guardar datos en la tabla: " . $wpdb->last_error);
+        return false; // Retorna false si hay un error al guardar los datos
     } else {
         error_log("Información de usuario guardada exitosamente: User ID {$user_id}, Email {$email}");
+        return true; // Retorna true si todo salió bien
     }
 }
+
 
 function is_member_valid($telegram_id) {
     global $wpdb;
@@ -86,8 +111,8 @@ function is_member_valid($telegram_id) {
     // Buscar usuario en la tabla telegram_users por ID de Telegram
     $user_data = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE user_id = %d", $telegram_id));
 
-    if (!$user_data) {
-        error_log("El ID {$telegram_id} no corresponde a ningún usuario de Telegram en nuestra base de datos.");
+    if (!$user_data || $user_data->is_in_group == 0) {
+        error_log("El ID {$telegram_id} no corresponde a ningún usuario de Telegram en nuestra base de datos o el usuario no está en el grupo.");
         return false;
     }
 
@@ -264,21 +289,29 @@ function handle_subscription_status_change($subscription_id, $old_status, $new_s
         case 'active':
             error_log("La suscripción con ID {$subscription_id} ha cambiado a estado activo.");
             // No haces nada en este caso, ya que el usuario ya está en el grupo.
+             // Actualizar el campo is_in_group a 1
+            $wpdb->update($table_name, ['is_in_group' => 1], ['email' => $user_email]);
             break;
         case 'on-hold':
         case 'expired':
             error_log("La suscripción con ID {$subscription_id} ha cambiado a estado {$new_status}. Procediendo a remover al usuario del grupo.");
-            kickMember($user_data->user_id);;
+             // Actualizar el campo is_in_group a 0
+            $wpdb->update($table_name, ['is_in_group' => 0], ['email' => $user_email]);
+            kickMember($user_data->user_id);
             sendMessage($user_data->chat_id, "Tu suscripción ha sido cancelada. Has sido eliminado del grupo.");
             break;
         case 'cancelled':
             error_log("La suscripción con ID {$subscription_id} ha cambiado a estado {$new_status}. Procediendo a remover al usuario del grupo.");
-            kickMember($user_data->user_id);;
+             // Actualizar el campo is_in_group a 0
+            $wpdb->update($table_name, ['is_in_group' => 0], ['email' => $user_email]);
+            kickMember($user_data->user_id);
             sendMessage($user_data->chat_id, "Tu suscripción ha sido cancelada. Has sido eliminado del grupo.");
             break;
         case 'pending-cancel':
             error_log("La suscripción con ID {$subscription_id} ha cambiado a estado {$new_status}. Procediendo a remover al usuario del grupo.");
-            kickMember($user_data->user_id);;
+             // Actualizar el campo is_in_group a 0
+            $wpdb->update($table_name, ['is_in_group' => 0], ['email' => $user_email]);
+            kickMember($user_data->user_id);
             sendMessage($user_data->chat_id, "Tu suscripción ha caducado, está en espera, ha sido cancelada o está pendiente de cancelación. Has sido removido del grupo.");
             break;
         default:

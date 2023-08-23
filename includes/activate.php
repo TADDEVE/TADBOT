@@ -11,7 +11,8 @@ function telegram_bot_activate() {
         username tinytext NOT NULL,
         user_id bigint(20) NOT NULL,
         chat_id bigint(20) NOT NULL,
-        email varchar(255) DEFAULT '' NOT NULL,   -- Agregamos el campo email
+        email varchar(255) DEFAULT '' NOT NULL,
+        is_in_group tinyint(1) DEFAULT 0 NOT NULL,   -- Agregamos el campo is_in_group
         UNIQUE KEY id (id)
     ) $charset_collate;";
 
@@ -36,4 +37,5 @@ function telegram_bot_activate() {
 
 // Cambia __FILE__ por la ubicación de tu archivo principal del plugin.
 register_activation_hook('telegram-bot-manager/telegram-bot-manager.php', 'telegram_bot_activate');
+
 ?>
